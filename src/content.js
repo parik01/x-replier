@@ -1,124 +1,170 @@
 (() => {
-  const DEFAULTS = { mode: "draft", dailyLimit: 10, minDelaySec: 45, maxDelaySec: 120, minPostLength: 35 };
-  let running = false;
-  let stopRequested = false;
+  const Core = globalThis.XReplierCore;
+  const Sel = globalThis.XReplierSelectors;
+  let controller = null;
+  let job = null;
+  let heartbeat = null;
+  let panel = null;
+  let pendingChoice = null;
 
   chrome.runtime.onMessage.addListener((message, _sender, respond) => {
-    if (message.type === "START_REPLIER") {
-      start().then(respond);
-      return true;
-    }
-    if (message.type === "STOP_REPLIER") {
-      stopRequested = true;
-      respond({ ok: true });
-    }
+    if (message.type === "START_REPLIER") { start().then(respond); return true; }
+    if (message.type === "STOP_REPLIER") { stop("Остановлено пользователем."); respond({ ok: true }); }
   });
 
   async function start() {
-    if (running) return { ok: false, error: "Реплаер уже запущен в этой вкладке." };
+    if (controller) return { ok: false, error: "Реплаер уже запущен в этой вкладке." };
     if (!/^(x|twitter)\.com$/i.test(location.hostname)) return { ok: false, error: "Откройте ленту на x.com." };
-    running = true;
-    stopRequested = false;
+    const claimed = await message({ type: "CLAIM_JOB" });
+    if (!claimed?.ok) return claimed || { ok: false, error: "Не удалось заблокировать задачу." };
+    job = claimed.job;
+    controller = new AbortController();
+    heartbeat = setInterval(() => message({ type: "HEARTBEAT_JOB", jobId: job.id }), 10000);
+    renderPanel();
     try {
-      const { settings = DEFAULTS, history = {} } = await chrome.storage.local.get(["settings", "history"]);
-      const today = new Date().toISOString().slice(0, 10);
-      const sentToday = history.day === today ? Number(history.sentToday || 0) : 0;
-      const slots = Math.max(0, Number(settings.dailyLimit || 0) - sentToday);
-      if (!slots) return { ok: false, error: "Дневной лимит уже исчерпан." };
-      const targets = collectTargets(settings, history.replied || {}).slice(0, slots);
-      if (!targets.length) return { ok: false, error: "В видимой части ленты нет подходящих постов." };
-      showStatus(`Найдено постов: ${targets.length}`);
+      const { settings: rawSettings, history: rawHistory } = await chrome.storage.local.get(["settings", "history"]);
+      const valid = Core.validateSettings(rawSettings);
+      if (!valid.ok) throw new Error(valid.errors[0]);
+      const settings = valid.settings;
+      let history = Core.normalizeHistory(rawHistory);
+      const available = settings.dailyLimit - history.sentToday;
+      if (available <= 0) throw new Error("Дневной лимит уже исчерпан.");
+      const queue = collectTargets(settings, history).slice(0, available);
+      if (!queue.length) throw new Error("В видимой части ленты нет подходящих постов.");
+      setPanel(`Найдено целей: ${queue.length}.`, { running: true });
       let completed = 0;
-      for (const target of targets) {
-        if (stopRequested) break;
-        showStatus(`Генерирую ответ ${completed + 1}/${targets.length}…`);
-        const generated = await chrome.runtime.sendMessage({ type: "GENERATE_REPLY", postText: target.text });
-        if (!generated?.ok) throw new Error(generated?.error || "Не удалось сгенерировать ответ.");
-        const composer = await openComposer(target.card);
-        if (!composer) { showStatus("Не удалось открыть редактор ответа; пост пропущен."); continue; }
-        setComposerText(composer, generated.reply);
-        if (settings.mode === "auto") {
-          const seconds = randomInt(Number(settings.minDelaySec), Number(settings.maxDelaySec));
-          showStatus(`Черновик готов. Автоотправка через ${seconds} сек…`);
-          await delay(seconds * 1000);
-          if (stopRequested) break;
-          const sent = clickSend();
-          if (!sent) { showStatus("Кнопка «Ответить» не найдена; черновик оставлен для ручной отправки."); break; }
-          await remember(target.id, today, sentToday + completed + 1);
-          completed += 1;
-          await delay(1300);
-        } else {
-          await remember(target.id, today, sentToday + completed + 1);
-          completed += 1;
-          showStatus("Черновик вставлен. Проверьте и отправьте его вручную.");
-          break;
+      for (let index = 0; index < queue.length; index += 1) {
+        throwIfAborted();
+        const target = queue[index];
+        setPanel(`Цель ${index + 1}/${queue.length}: @${target.handle}. Генерирую…`, { running: true, target });
+        const card = await findCardWhenAvailable(target.postId, controller.signal);
+        if (!card) { history = await saveState(history, target.postId, "failed"); continue; }
+        let response = await message({ type: "GENERATE_REPLY", postText: target.text });
+        throwIfAborted();
+        if (!response?.ok) { history = await saveState(history, target.postId, "failed"); setPanel(response?.error || "Не удалось создать черновик.", { running: true, target }); continue; }
+        const composer = await openComposer(card, controller.signal);
+        if (!composer) { history = await saveState(history, target.postId, "failed"); continue; }
+        const inserted = setComposerText(composer, response.reply);
+        if (!inserted.ok) { history = await saveState(history, target.postId, "failed"); setPanel(`Черновик не вставлен: ${inserted.error}`, { running: true, target }); continue; }
+        history = await saveState(history, target.postId, "drafted");
+        if (settings.mode === "draft") {
+          setPanel("Черновик вставлен. Проверьте текст и выберите действие.", { draft: true, target, reply: inserted.actualText });
+          const action = await waitForChoice(controller.signal);
+          if (action === "sent") { history = await saveState(history, target.postId, "sent"); completed += 1; }
+          if (action === "skip") history = await saveState(history, target.postId, "skipped");
+          if (action === "next") setPanel("Черновик оставлен как черновик.", { running: true, target });
+          continue;
         }
+        const seconds = Core.randomDelay(settings.minDelaySec, settings.maxDelaySec);
+        setPanel(`Черновик проверен. Автоотправка через ${seconds} сек…`, { running: true, target, countdown: seconds });
+        await abortableDelay(seconds * 1000, controller.signal, (left) => setPanel(`Автоотправка через ${left} сек…`, { running: true, target, countdown: left }));
+        throwIfAborted();
+        history = await saveState(history, target.postId, "sending");
+        const sent = await sendAndVerify(composer, controller.signal);
+        if (sent.status === "sent") { history = await saveState(history, target.postId, "sent"); completed += 1; }
+        else history = await saveState(history, target.postId, sent.status);
+        setPanel(sent.message, { running: true, target });
       }
-      return { ok: true, completed, stopped: stopRequested };
+      setPanel(`Готово. Подтверждённых отправок: ${completed}.`, { finished: true });
+      return { ok: true, completed };
     } catch (error) {
-      showStatus(`Ошибка: ${error.message || error}`);
-      return { ok: false, error: error.message || String(error) };
-    } finally { running = false; }
+      const stopped = error.name === "AbortError";
+      setPanel(stopped ? "Остановлено пользователем." : `Ошибка: ${error.message || error}`, { finished: true });
+      return { ok: stopped, stopped, error: stopped ? undefined : (error.message || String(error)) };
+    } finally { await cleanup(); }
   }
 
-  function collectTargets(settings, replied) {
-    const seen = new Set();
-    const ownHandle = getOwnHandle();
-    return [...document.querySelectorAll('article[data-testid="tweet"]')].map((card) => {
-      const link = [...card.querySelectorAll('a[href*="/status/"]')].find(a => /\/[A-Za-z0-9_]+\/status\/\d+/.test(a.getAttribute("href") || ""));
-      const match = (link?.getAttribute("href") || "").match(/\/([A-Za-z0-9_]+)\/status\/(\d+)/);
-      const text = [...card.querySelectorAll('[data-testid="tweetText"]')].map(el => el.innerText).join("\n").trim();
-      const cardText = card.innerText || "";
-      return { card, id: match?.[2], handle: match?.[1]?.toLowerCase(), text, promoted: /\bPromoted\b|Реклама/i.test(cardText), repost: /\bReposted\b|Репост/i.test(cardText), reply: /^Replying to|^В ответ/i.test(cardText) };
-    }).filter((post) => post.id && post.text.length >= Number(settings.minPostLength || 35) && !post.promoted && !post.repost && !post.reply && post.handle !== ownHandle && !replied[post.id] && !seen.has(post.id) && seen.add(post.id));
+  function collectTargets(settings, history) {
+    const ownHandle = Sel.getOwnHandle(); const seen = new Set();
+    const targets = [];
+    for (const card of document.querySelectorAll('article[data-testid="tweet"]')) {
+      const post = Sel.candidateFromCard(card);
+      if (!post || seen.has(post.postId)) continue;
+      seen.add(post.postId);
+      if (post.promoted || post.repost || post.reply || post.handle === ownHandle || post.text.length < settings.minPostLength || Core.isProcessed(history, post.postId)) continue;
+      targets.push({ ...post, discoveredAt: Date.now(), state: "discovered" });
+    }
+    return targets;
   }
 
-  function getOwnHandle() {
-    const profile = document.querySelector('a[data-testid="AppTabBar_Profile_Link"]');
-    return (profile?.getAttribute("href") || "").replace(/^\//, "").toLowerCase();
+  async function findCardWhenAvailable(postId, signal) {
+    const initial = Sel.findCard(postId); if (initial) return initial;
+    return waitFor(() => Sel.findCard(postId), 5000, signal);
   }
 
-  async function openComposer(card) {
+  async function openComposer(card, signal) {
     const button = card.querySelector('[data-testid="reply"]');
     if (!button) return null;
     button.click();
-    return waitFor(() => document.querySelector('[role="dialog"] [data-testid="tweetTextarea_0"], [data-testid="tweetTextarea_0"]'), 6000);
+    return waitFor(() => document.querySelector('[role="dialog"] [data-testid="tweetTextarea_0"], [data-testid="tweetTextarea_0"]'), 6000, signal);
   }
 
   function setComposerText(element, text) {
-    element.focus();
-    const range = document.createRange();
-    range.selectNodeContents(element);
-    range.collapse(true);
-    const selection = window.getSelection();
-    selection.removeAllRanges(); selection.addRange(range);
-    try {
-      const data = new DataTransfer(); data.setData("text/plain", text);
-      element.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: data }));
-    } catch (_) {
-      document.execCommand("insertText", false, text);
-      element.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
+    const expected = String(text).trim();
+    if (!expected) return { ok: false, error: "Пустой черновик." };
+    clearEditor(element);
+    const strategies = [
+      () => { const data = new DataTransfer(); data.setData("text/plain", expected); element.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: data })); return "paste"; },
+      () => { element.focus(); document.execCommand("insertText", false, expected); return "execCommand"; },
+      () => { element.textContent = expected; element.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: expected })); return "dom"; }
+    ];
+    for (const run of strategies) {
+      clearEditor(element);
+      try {
+        const strategy = run(); const actualText = editorText(element);
+        if (actualText === expected) return { ok: true, strategy, actualText };
+      } catch (_) {}
     }
+    return { ok: false, error: "X не подтвердил вставку текста." };
   }
 
-  function clickSend() {
-    const dialogs = [...document.querySelectorAll('[role="dialog"]')];
-    const scope = dialogs.at(-1) || document;
-    const button = scope.querySelector('[data-testid="tweetButton"]');
-    if (!button || button.disabled || button.getAttribute("aria-disabled") === "true") return false;
-    button.click(); return true;
+  function clearEditor(element) {
+    element.focus();
+    const range = document.createRange(); range.selectNodeContents(element); range.collapse(false);
+    const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range);
+    document.execCommand("delete", false);
+    if (editorText(element)) { element.replaceChildren(); element.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward" })); }
+  }
+  function editorText(element) { return (element.innerText || element.textContent || "").replace(/\r/g, "").trim(); }
+
+  async function sendAndVerify(composer, signal) {
+    const button = [...document.querySelectorAll('[role="dialog"]')].at(-1)?.querySelector('[data-testid="tweetButton"]') || document.querySelector('[data-testid="tweetButton"]');
+    if (!button || button.disabled || button.getAttribute("aria-disabled") === "true") return { status: "failed", message: "Кнопка отправки недоступна; черновик сохранён." };
+    button.click();
+    const result = await waitFor(() => {
+      const error = [...document.querySelectorAll('[role="alert"]')].map((el) => el.innerText).find((text) => /error|ошибк|try again|повтор/i.test(text || ""));
+      if (error) return { status: "failed", message: `X сообщил об ошибке: ${error}` };
+      if (!document.contains(composer) || !composer.closest('[role="dialog"]')) return { status: "sent", message: "X закрыл редактор: отправка подтверждена." };
+      return null;
+    }, 10000, signal);
+    return result || { status: "unknown", message: "Не удалось надёжно подтвердить отправку. Проверьте X вручную." };
   }
 
-  async function remember(id, day, count) {
-    const { history = {} } = await chrome.storage.local.get("history");
-    const replied = history.replied || {};
-    replied[id] = Date.now();
-    const ids = Object.entries(replied).sort((a, b) => b[1] - a[1]).slice(0, 3000);
-    await chrome.storage.local.set({ history: { day, sentToday: count, replied: Object.fromEntries(ids) } });
+  async function saveState(history, postId, state) {
+    const next = Core.applyPostState(history, postId, state);
+    await chrome.storage.local.set({ history: next }); return next;
   }
 
-  function waitFor(find, timeout) { return new Promise(resolve => { const until = Date.now() + timeout; const id = setInterval(() => { const el = find(); if (el || Date.now() > until) { clearInterval(id); resolve(el || null); } }, 150); }); }
-  function delay(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
-  function randomInt(min, max) { min = Math.max(1, min || 1); max = Math.max(min, max || min); return Math.floor(min + Math.random() * (max - min + 1)); }
-  function showStatus(text) { let el = document.getElementById("x-replier-status"); if (!el) { el = document.createElement("div"); el.id = "x-replier-status"; document.body.append(el); } el.textContent = `X-replier: ${text}`; }
+  function stop(reason) {
+    if (controller && !controller.signal.aborted) controller.abort(reason);
+    pendingChoice?.("next"); pendingChoice = null;
+  }
+  function throwIfAborted() { if (controller?.signal.aborted) throw new DOMException("Stopped", "AbortError"); }
+  async function cleanup() {
+    if (heartbeat) clearInterval(heartbeat);
+    if (job) await message({ type: "RELEASE_JOB", jobId: job.id });
+    heartbeat = null; job = null; controller = null; pendingChoice = null;
+  }
+  function message(payload) { return chrome.runtime.sendMessage(payload); }
+
+  function waitFor(find, timeout, signal) { return new Promise((resolve, reject) => { const end = Date.now() + timeout; const timer = setInterval(check, 120); const cancel = () => done(reject, new DOMException("Stopped", "AbortError")); signal?.addEventListener("abort", cancel, { once: true }); function done(fn, value) { clearInterval(timer); signal?.removeEventListener("abort", cancel); fn(value); } function check() { const value = find(); if (value) done(resolve, value); else if (Date.now() >= end) done(resolve, null); } check(); }); }
+  function abortableDelay(ms, signal, onTick) { return new Promise((resolve, reject) => { const end = Date.now() + ms; const timer = setInterval(tick, 250); const cancel = () => done(reject, new DOMException("Stopped", "AbortError")); signal.addEventListener("abort", cancel, { once: true }); function done(fn, value) { clearInterval(timer); signal.removeEventListener("abort", cancel); fn(value); } function tick() { const left = Math.max(0, Math.ceil((end - Date.now()) / 1000)); onTick?.(left); if (left <= 0) done(resolve); } tick(); }); }
+
+  function renderPanel() {
+    if (panel) return; panel = document.createElement("aside"); panel.id = "x-replier-panel";
+    panel.innerHTML = '<strong>X-replier</strong><p id="x-replier-status">Подготовка…</p><p id="x-replier-target"></p><div id="x-replier-actions"><button data-action="sent">Отправлено</button><button data-action="skip">Пропустить</button><button data-action="next">Следующий</button><button data-action="stop">Стоп</button></div>';
+    panel.addEventListener("click", (event) => { const action = event.target.dataset.action; if (!action) return; if (action === "stop") stop(); else if (pendingChoice) { pendingChoice(action); pendingChoice = null; } }); document.body.append(panel);
+  }
+  function setPanel(text, options = {}) { renderPanel(); panel.querySelector("#x-replier-status").textContent = text; panel.querySelector("#x-replier-target").textContent = options.target ? `@${options.target.handle} · ${options.target.postId}` : ""; const actions = panel.querySelector("#x-replier-actions"); actions.classList.toggle("draft", Boolean(options.draft)); actions.querySelector('[data-action="stop"]').style.display = options.finished ? "none" : "inline-block"; }
+  function waitForChoice(signal) { return new Promise((resolve, reject) => { const cancel = () => { pendingChoice = null; reject(new DOMException("Stopped", "AbortError")); }; pendingChoice = (action) => { signal.removeEventListener("abort", cancel); resolve(action); }; signal.addEventListener("abort", cancel, { once: true }); }); }
 })();
