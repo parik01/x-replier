@@ -81,7 +81,8 @@
       const post = Sel.candidateFromCard(card);
       if (!post || seen.has(post.postId)) continue;
       seen.add(post.postId);
-      if (post.promoted || post.repost || post.reply || post.handle === ownHandle || post.text.length < settings.minPostLength || Core.isProcessed(history, post.postId)) continue;
+      const reason = Core.targetFilterReason(post, { ownHandle, history, minPostLength: settings.minPostLength, seen: new Set() });
+      if (reason) continue;
       targets.push({ ...post, discoveredAt: Date.now(), state: "discovered" });
     }
     return targets;
