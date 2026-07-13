@@ -1,6 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const Core = require("../src/core.js");
+const Selectors = require("../src/selectors.js");
 
 test("validates delays and auto confirmation", () => {
   assert.equal(Core.validateSettings({ minDelaySec: 50, maxDelaySec: 10 }).ok, false);
@@ -22,6 +23,22 @@ test("failed and unknown states do not count as sent", () => {
   const history = Core.emptyHistory();
   assert.equal(Core.applyPostState(history, "1", "failed").sentToday, 0);
   assert.equal(Core.applyPostState(history, "2", "unknown").sentToday, 0);
+});
+
+test("filters unsuitable targets and preserves valid ones", () => {
+  const base = { postId: "1", handle: "other", text: "a useful post with enough text to pass the minimum filter" };
+  assert.equal(Core.targetFilterReason(base, { ownHandle: "me" }), null);
+  assert.equal(Core.targetFilterReason({ ...base, promoted: true }, { ownHandle: "me" }), "promoted");
+  assert.equal(Core.targetFilterReason({ ...base, repost: true }, { ownHandle: "me" }), "repost");
+  assert.equal(Core.targetFilterReason({ ...base, reply: true }, { ownHandle: "me" }), "reply");
+  assert.equal(Core.targetFilterReason({ ...base, handle: "me" }, { ownHandle: "me" }), "self");
+  assert.equal(Core.targetFilterReason({ ...base, text: "tiny" }, { ownHandle: "me" }), "short");
+  assert.equal(Core.targetFilterReason(base, { ownHandle: "me", history: Core.applyPostState(Core.emptyHistory(), "1", "sent") }), "processed");
+});
+
+test("parses canonical X status URLs", () => {
+  assert.deepEqual(Selectors.parseStatusHref("/Ada_99/status/12345"), { handle: "ada_99", postId: "12345", postUrl: "https://x.com/Ada_99/status/12345" });
+  assert.equal(Selectors.parseStatusHref("/Ada_99/photo/1"), null);
 });
 
 test("cleans model reply and rejects long reply", () => {
