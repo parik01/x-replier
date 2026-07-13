@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><link rel="stylesheet" href="popup.css"><title>X-replier</title></head>
+<body><main><h1>X-replier</h1><p class="hint">Откройте ленту X, настройте AI и запустите обработку видимых постов.</p>
+<label>OpenAI API key<input id="apiKey" type="password" autocomplete="off" placeholder="sk-…"></label>
+<label>Модель<input id="model" value="gpt-4.1-mini"></label>
+<label>Стиль / системный промпт<textarea id="systemPrompt" rows="5"></textarea></label>
+<div class="grid"><label>Лимит в день<input id="dailyLimit" type="number" min="1" max="100"></label><label>Мин. длина поста<input id="minPostLength" type="number" min="1"></label><label>Пауза от, сек<input id="minDelaySec" type="number" min="1"></label><label>Пауза до, сек<input id="maxDelaySec" type="number" min="1"></label></div>
+<label class="mode"><input id="autoMode" type="checkbox"> Автоотправка после задержки</label><p class="warning">В ручном режиме расширение только вставляет черновик. В авто-режиме оно нажмёт «Ответить» после заданной паузы.</p>
+<div class="actions"><button id="save">Сохранить</button><button id="start" class="primary">Запустить</button><button id="stop">Стоп</button></div><p id="status" role="status"></p>
+</main><script src="popup.js"></script></body></html>
