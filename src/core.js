@@ -78,6 +78,18 @@
     return ["draftedPosts", "sentPosts", "skippedPosts", "failedPosts", "unknownPosts"].some((key) => Boolean(history?.[key]?.[postId]));
   }
 
+  function targetFilterReason(post, { ownHandle = "", history = {}, minPostLength = 35, seen = new Set() } = {}) {
+    if (!post?.postId || !post?.handle) return "meta";
+    if (post.promoted) return "promoted";
+    if (post.repost) return "repost";
+    if (post.reply) return "reply";
+    if (String(post.handle).toLowerCase() === String(ownHandle).toLowerCase()) return "self";
+    if (String(post.text || "").trim().length < minPostLength) return "short";
+    if (isProcessed(history, post.postId)) return "processed";
+    if (seen.has(post.postId)) return "duplicate";
+    return null;
+  }
+
   function cleanReply(value, maxLength = 280) {
     let reply = String(value || "").trim();
     const json = reply.match(/\{[\s\S]*\}/);
@@ -95,7 +107,7 @@
 
   function lockExpired(lock, now = Date.now(), ttlMs = 30000) { return !lock || !lock.heartbeatAt || now - lock.heartbeatAt > ttlMs; }
 
-  const api = { DEFAULT_SETTINGS, MAX_HISTORY, localDay, validateSettings, emptyHistory, normalizeHistory, pruneMap, applyPostState, isProcessed, cleanReply, randomDelay, lockExpired };
+  const api = { DEFAULT_SETTINGS, MAX_HISTORY, localDay, validateSettings, emptyHistory, normalizeHistory, pruneMap, applyPostState, isProcessed, targetFilterReason, cleanReply, randomDelay, lockExpired };
   globalThis.XReplierCore = api;
   if (typeof module !== "undefined") module.exports = api;
 })();
