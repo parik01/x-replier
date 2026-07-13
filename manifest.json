@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "X-replier",
+  "version": "0.1.0",
+  "description": "Генерирует и подставляет ответы на посты в X.",
+  "permissions": ["storage", "tabs"],
+  "host_permissions": ["https://x.com/*", "https://twitter.com/*", "https://api.openai.com/*"],
+  "background": { "service_worker": "src/background.js", "type": "module" },
+  "action": { "default_popup": "src/popup.html", "default_title": "X-replier" },
+  "content_scripts": [{
+    "matches": ["https://x.com/*", "https://twitter.com/*"],
+    "js": ["src/content.js"],
+    "css": ["src/content.css"],
+    "run_at": "document_idle"
+  }]
+}
